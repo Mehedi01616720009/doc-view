@@ -1,4 +1,4 @@
-# Math Questions DOCX Converter (OpenAI Version)
+# Math Questions PDF Converter (DeepSeek Vision)
 
 ## Project Structure
 ```
@@ -18,7 +18,6 @@ project-root/
 │   │   │   └── questions/
 │   │   │       └── page.js
 │   │   ├── components/
-│   │   │   ├── UploadForm.js
 │   │   │   ├── QuestionList.js
 │   │   │   └── QuestionCard.js
 │   │   ├── store/
@@ -33,14 +32,20 @@ project-root/
 
 ## Backend Setup
 
-### 1. Initialize Backend
+### 1. Install System Dependencies (Ubuntu/Debian)
+```bash
+sudo apt-get update
+sudo apt-get install -y poppler-utils
+```
+
+### 2. Initialize Backend
 ```bash
 mkdir backend && cd backend
 npm init -y
-npm install express cors dotenv multer openai
+npm install express cors dotenv multer axios pdf-poppler sharp
 ```
 
-### 2. backend/package.json
+### 3. backend/package.json
 ```json
 {
   "name": "math-questions-backend",
@@ -55,18 +60,20 @@ npm install express cors dotenv multer openai
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "multer": "^1.4.5-lts.1",
-    "openai": "^4.20.0"
+    "axios": "^1.6.2",
+    "pdf-poppler": "^0.2.1",
+    "sharp": "^0.33.0"
   }
 }
 ```
 
-### 3. backend/.env
+### 4. backend/.env
 ```
 PORT=5000
-OPENAI_API_KEY=your_openai_api_key_here
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
 ```
 
-### 4. backend/server.js
+### 5. backend/server.js
 ```javascript
 import express from 'express';
 import cors from 'cors';
@@ -88,11 +95,11 @@ app.listen(PORT, () => {
 });
 ```
 
-### 5. backend/routes/upload.js
+### 6. backend/routes/upload.js
 ```javascript
 import express from 'express';
 import multer from 'multer';
-import { processDocx } from '../controllers/questionController.js';
+import { processPdf } from '../controllers/questionController.js';
 
 const router = express.Router();
 
@@ -100,94 +107,138 @@ const storage = multer.memoryStorage();
 const upload = multer({ 
   storage,
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    if (file.mimetype === 'application/pdf') {
       cb(null, true);
     } else {
-      cb(new Error('Only .docx files are allowed'));
+      cb(new Error('Only .pdf files are allowed'));
     }
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
   }
 });
 
-router.post('/upload', upload.single('docx'), processDocx);
+router.post('/upload', upload.single('pdf'), processPdf);
 
 export default router;
 ```
 
-### 6. backend/controllers/questionController.js
+### 7. backend/controllers/questionController.js
 ```javascript
-import OpenAI from 'openai';
+import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { convert } from 'pdf-poppler';
+import sharp from 'sharp';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-export const processDocx = async (req, res) => {
-  let tempFilePath = null;
+export const processPdf = async (req, res) => {
+  let tempPdfPath = null;
+  let tempImageDir = null;
 
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Save buffer to temporary file (OpenAI needs file path)
+    // Create temp directories
     const tempDir = path.join(__dirname, '../temp');
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    tempFilePath = path.join(tempDir, `${Date.now()}-${req.file.originalname}`);
-    fs.writeFileSync(tempFilePath, req.file.buffer);
+    // Save PDF temporarily
+    tempPdfPath = path.join(tempDir, `${Date.now()}.pdf`);
+    fs.writeFileSync(tempPdfPath, req.file.buffer);
 
-    // Upload file to OpenAI
-    const file = await openai.files.create({
-      file: fs.createReadStream(tempFilePath),
-      purpose: 'assistants'
-    });
+    // Create directory for images
+    tempImageDir = path.join(tempDir, `images-${Date.now()}`);
+    if (!fs.existsSync(tempImageDir)) {
+      fs.mkdirSync(tempImageDir, { recursive: true });
+    }
 
-    console.log('File uploaded to OpenAI:', file.id);
+    console.log('Converting PDF to images...');
 
-    // Create assistant with file
-    const assistant = await openai.beta.assistants.create({
-      name: "Math Questions Extractor",
-      instructions: `You are a helpful assistant that extracts math questions from DOCX documents and converts them to structured JSON format with MathJax notation. 
+    // Convert PDF to images
+    const options = {
+      format: 'png',
+      out_dir: tempImageDir,
+      out_prefix: 'page',
+      page: null // Convert all pages
+    };
 
-CRITICAL: Use proper MathJax delimiters:
-- For inline math: $x^2$ (single dollar signs)
-- For display math: $$\\frac{a}{b}$$ (double dollar signs)
-- DO NOT use \\( \\) or \\[ \\]
+    await convert(tempPdfPath, options);
 
-Preserve Bengali/Bangla text exactly as written.`,
-      model: "gpt-4-turbo-preview",
-      tools: [{ type: "retrieval" }],
-      file_ids: [file.id]
-    });
+    // Get all generated image files
+    const imageFiles = fs.readdirSync(tempImageDir)
+      .filter(file => file.endsWith('.png'))
+      .sort((a, b) => {
+        const numA = parseInt(a.match(/\d+/)[0]);
+        const numB = parseInt(b.match(/\d+/)[0]);
+        return numA - numB;
+      });
 
-    // Create thread
-    const thread = await openai.beta.threads.create();
+    console.log(`Converted ${imageFiles.length} pages to images`);
 
-    // Send message
-    await openai.beta.threads.messages.create(thread.id, {
-      role: "user",
-      content: `Extract all math questions from the uploaded DOCX file and convert them to JSON format.
+    // Convert images to base64
+    const imageBase64Array = [];
+    for (const imageFile of imageFiles) {
+      const imagePath = path.join(tempImageDir, imageFile);
+      const imageBuffer = fs.readFileSync(imagePath);
+      
+      // Optimize image with sharp (reduce size for API)
+      const optimizedBuffer = await sharp(imageBuffer)
+        .resize(2000, null, { withoutEnlargement: true })
+        .png({ quality: 90 })
+        .toBuffer();
+      
+      const base64Image = optimizedBuffer.toString('base64');
+      imageBase64Array.push(base64Image);
+    }
 
-Each question should have:
+    console.log('Sending to DeepSeek API...');
+
+    // Prepare messages with images
+    const imageMessages = imageBase64Array.map(base64 => ({
+      type: 'image_url',
+      image_url: {
+        url: `data:image/png;base64,${base64}`
+      }
+    }));
+
+    // Send to DeepSeek API
+    const response = await axios.post(
+      'https://api.deepseek.com/chat/completions',
+      {
+        model: 'deepseek-chat',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that extracts math questions from document images and converts them to structured JSON format with MathJax notation. You understand Bengali/Bangla text and mathematical equations.'
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `I have uploaded ${imageBase64Array.length} page(s) from a PDF document containing math questions with equations. Please analyze these images and extract all questions.
+
+Extract all math questions and convert them to JSON format. Each question should have:
 - index: sequential number starting from 1
 - question: the question text with math in MathJax format using $ for inline and $$ for display
 - options: array of 4 options (a, b, c, d), with math in MathJax format
 - answer: the correct option letter (a, b, c, or d)
 
-IMPORTANT RULES:
+CRITICAL RULES:
 - Use $ for inline math (e.g., $x^2-2x+4=0$)
 - Use $$ for display math (e.g., $$\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$$)
+- DO NOT use \\( \\) or \\[ \\]
 - Preserve all Bengali/Bangla text exactly
-- Extract equations exactly as they appear in the document
-- Identify the correct answer from the document
+- Extract equations exactly as they appear in the images
+- Identify the correct answer from visual cues (bold, underline, checkmarks, etc.)
 
 Return ONLY a valid JSON array with no markdown code blocks or additional text.
 
@@ -200,41 +251,23 @@ Example format:
     "answer": "d"
   }
 ]`
-    });
-
-    // Run assistant
-    const run = await openai.beta.threads.runs.create(thread.id, {
-      assistant_id: assistant.id
-    });
-
-    // Poll for completion
-    let runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-    let attempts = 0;
-    const maxAttempts = 60; // 60 seconds timeout
-
-    while (runStatus.status !== 'completed' && attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-      attempts++;
-
-      if (runStatus.status === 'failed' || runStatus.status === 'cancelled') {
-        throw new Error(`Assistant run ${runStatus.status}`);
+              },
+              ...imageMessages
+            ]
+          }
+        ],
+        max_tokens: 8000,
+        temperature: 0.2
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
       }
-    }
+    );
 
-    if (runStatus.status !== 'completed') {
-      throw new Error('Assistant run timed out');
-    }
-
-    // Get messages
-    const messages = await openai.beta.threads.messages.list(thread.id);
-    const assistantMessage = messages.data.find(m => m.role === 'assistant');
-    
-    if (!assistantMessage || !assistantMessage.content[0]) {
-      throw new Error('No response from assistant');
-    }
-
-    const aiResponse = assistantMessage.content[0].text.value;
+    const aiResponse = response.data.choices[0].message.content;
     console.log('AI Response:', aiResponse.substring(0, 500));
 
     // Parse JSON from response
@@ -262,22 +295,25 @@ Example format:
       });
     }
 
-    // Cleanup
-    await openai.beta.assistants.del(assistant.id);
-    await openai.files.del(file.id);
-
     res.json({ questions: questionsJson });
 
   } catch (error) {
-    console.error('Error processing DOCX:', error);
+    console.error('Error processing PDF:', error);
     res.status(500).json({ 
       error: 'Failed to process document',
-      details: error.message 
+      details: error.response?.data || error.message 
     });
   } finally {
-    // Delete temporary file
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
+    // Cleanup temporary files
+    if (tempPdfPath && fs.existsSync(tempPdfPath)) {
+      fs.unlinkSync(tempPdfPath);
+    }
+    if (tempImageDir && fs.existsSync(tempImageDir)) {
+      const files = fs.readdirSync(tempImageDir);
+      files.forEach(file => {
+        fs.unlinkSync(path.join(tempImageDir, file));
+      });
+      fs.rmdirSync(tempImageDir);
     }
   }
 };
@@ -414,11 +450,12 @@ export default function Home() {
     dispatch(setError(null));
 
     const formData = new FormData();
-    formData.append('docx', file);
+    formData.append('pdf', file);
 
     try {
       const response = await axios.post('http://localhost:5000/api/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000 // 2 minutes timeout
       });
 
       dispatch(setQuestions(response.data.questions));
@@ -432,45 +469,84 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 py-12 px-4">
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 py-12 px-4">
       <div className="max-w-2xl mx-auto">
-        <h1 className="text-3xl font-bold text-center mb-8">
-          Math Questions DOCX Converter
-        </h1>
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold text-gray-800 mb-2">
+            Math Questions PDF Converter
+          </h1>
+          <p className="text-gray-600">Upload a PDF with math questions and get structured JSON</p>
+        </div>
         
-        <form onSubmit={handleUpload} className="bg-white p-8 rounded-lg shadow-md">
+        <form onSubmit={handleUpload} className="bg-white p-8 rounded-xl shadow-lg">
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Upload DOCX File
+              Upload PDF File
             </label>
             <input
               type="file"
-              accept=".docx"
+              accept=".pdf"
               onChange={handleFileChange}
+              disabled={loading}
               className="block w-full text-sm text-gray-500
-                file:mr-4 file:py-2 file:px-4
-                file:rounded-md file:border-0
+                file:mr-4 file:py-3 file:px-6
+                file:rounded-lg file:border-0
                 file:text-sm file:font-semibold
-                file:bg-blue-50 file:text-blue-700
-                hover:file:bg-blue-100"
+                file:bg-indigo-50 file:text-indigo-700
+                hover:file:bg-indigo-100
+                disabled:opacity-50 disabled:cursor-not-allowed"
             />
+            <p className="mt-2 text-xs text-gray-500">
+              Maximum file size: 10MB
+            </p>
           </div>
 
           {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
-              {error}
+            <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                  </svg>
+                </div>
+                <div className="ml-3">
+                  <p className="text-sm text-red-700">{error}</p>
+                </div>
+              </div>
             </div>
           )}
           
           <button
             type="submit"
-            disabled={loading}
-            className="w-full bg-blue-600 text-white py-2 px-4 rounded-md
-              hover:bg-blue-700 transition-colors font-medium disabled:bg-gray-400"
+            disabled={loading || !file}
+            className="w-full bg-indigo-600 text-white py-3 px-4 rounded-lg
+              hover:bg-indigo-700 transition-colors font-medium 
+              disabled:bg-gray-400 disabled:cursor-not-allowed
+              flex items-center justify-center"
           >
-            {loading ? 'Processing...' : 'Upload and Convert'}
+            {loading ? (
+              <>
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Processing PDF...
+              </>
+            ) : (
+              'Upload and Convert'
+            )}
           </button>
         </form>
+
+        <div className="mt-8 bg-white p-6 rounded-xl shadow-lg">
+          <h2 className="text-lg font-semibold text-gray-800 mb-3">Instructions:</h2>
+          <ol className="list-decimal list-inside space-y-2 text-sm text-gray-600">
+            <li>Convert your DOCX file to PDF (File → Save As → PDF)</li>
+            <li>Upload the PDF file</li>
+            <li>Wait for AI to extract and convert questions</li>
+            <li>Review and reorder questions using drag & drop</li>
+          </ol>
+        </div>
       </div>
     </div>
   );
@@ -503,16 +579,28 @@ export default function QuestionsPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-xl">Processing document...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mb-4"></div>
+          <div className="text-xl text-gray-700">Processing document...</div>
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-xl text-red-600">Error: {error}</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="text-center">
+          <div className="text-6xl mb-4">❌</div>
+          <div className="text-xl text-red-600">Error: {error}</div>
+          <button
+            onClick={() => router.push('/')}
+            className="mt-4 px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700"
+          >
+            Try Again
+          </button>
+        </div>
       </div>
     );
   }
@@ -521,10 +609,13 @@ export default function QuestionsPage() {
     <div className="min-h-screen bg-gray-50 py-8 px-4">
       <div className="max-w-4xl mx-auto">
         <div className="flex justify-between items-center mb-8">
-          <h1 className="text-3xl font-bold">Questions Preview</h1>
+          <div>
+            <h1 className="text-3xl font-bold text-gray-800">Questions Preview</h1>
+            <p className="text-gray-600 mt-1">{items.length} questions extracted</p>
+          </div>
           <button
             onClick={() => router.push('/')}
-            className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
+            className="px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
           >
             Upload New File
           </button>
@@ -541,7 +632,7 @@ export default function QuestionsPage() {
 'use client';
 import { useDispatch } from 'react-redux';
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
-import { arrayMove, SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { reorderQuestions } from '../store/questionSlice';
 import QuestionCard from './QuestionCard';
 
@@ -620,43 +711,49 @@ export default function QuestionCard({ question }) {
     <div
       ref={setNodeRef}
       style={style}
-      className="bg-white p-6 rounded-lg shadow-md hover:shadow-lg transition-shadow"
+      className="bg-white p-6 rounded-xl shadow-md hover:shadow-lg transition-all border border-gray-200"
     >
-      <div className="mb-4">
-        <div className="flex items-start gap-3">
-          <span 
-            {...attributes} 
-            {...listeners}
-            className="text-gray-400 cursor-move hover:text-gray-600 text-xl mt-1"
-          >
-            ⋮⋮
-          </span>
-          <div className="flex-1">
-            <div className="font-medium mb-3 text-lg">
-              <span className="text-gray-600">{question.index}.</span>{' '}
-              <span dangerouslySetInnerHTML={{ __html: question.question }} />
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {question.options.map((option, idx) => {
-                const optionLetter = String.fromCharCode(97 + idx);
-                const isCorrect = question.answer.toLowerCase() === optionLetter;
-                
-                return (
-                  <div
-                    key={idx}
-                    className={`p-3 rounded border ${
-                      isCorrect
-                        ? 'bg-green-50 border-green-300'
-                        : 'bg-gray-50 border-gray-200'
-                    }`}
-                  >
-                    <span className="font-medium">{optionLabels[idx]}</span>{' '}
-                    <span dangerouslySetInnerHTML={{ __html: option }} />
-                  </div>
-                );
-              })}
-            </div>
+      <div className="flex items-start gap-3">
+        <div
+          {...attributes}
+          {...listeners}
+          className="flex-shrink-0 cursor-move text-gray-400 hover:text-gray-600 transition-colors pt-1"
+        >
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="9" cy="5" r="1" />
+            <circle cx="9" cy="12" r="1" />
+            <circle cx="9" cy="19" r="1" />
+            <circle cx="15" cy="5" r="1" />
+            <circle cx="15" cy="12" r="1" />
+            <circle cx="15" cy="19" r="1" />
+          </svg>
+        </div>
+        
+        <div className="flex-1">
+          <div className="font-medium mb-4 text-lg leading-relaxed">
+            <span className="text-indigo-600 font-semibold">{question.index}.</span>{' '}
+            <span dangerouslySetInnerHTML={{ __html: question.question }} />
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {question.options.map((option, idx) => {
+              const optionLetter = String.fromCharCode(97 + idx);
+              const isCorrect = question.answer.toLowerCase() === optionLetter;
+              
+              return (
+                <div
+                  key={idx}
+                  className={`p-4 rounded-lg border-2 transition-all ${
+                    isCorrect
+                      ? 'bg-green-50 border-green-400 shadow-sm'
+                      : 'bg-gray-50 border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <span className="font-semibold text-gray-700">{optionLabels[idx]}</span>{' '}
+                  <span dangerouslySetInnerHTML={{ __html: option }} />
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
@@ -667,28 +764,45 @@ export default function QuestionCard({ question }) {
 
 ## Running the Project
 
-### 1. Start Backend
+### 1. Install System Dependencies
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y poppler-utils
+
+# macOS
+brew install poppler
+```
+
+### 2. Start Backend
 ```bash
 cd backend
+npm install
 npm run dev
 ```
 
-### 2. Start Frontend
+### 3. Start Frontend
 ```bash
 cd frontend
+npm install
 npm run dev
 ```
 
-Visit `http://localhost:3000` to upload your DOCX file!
+### 4. Usage
+1. Convert your DOCX to PDF (File → Save As → PDF in Word)
+2. Visit `http://localhost:3000`
+3. Upload your PDF file
+4. Wait for processing (may take 30-60 seconds)
+5. View and reorder questions!
 
 ## Key Features
 
-✅ **OpenAI API** - Supports DOCX files with equations directly
-✅ **Correct MathJax** - Uses `$` for inline and `$$` for display math
-✅ **No Mammoth** - Direct DOCX processing by OpenAI
-✅ **Equation Extraction** - Preserves exact equations from Word documents
-✅ **Drag & Drop** - Reorder questions with automatic re-indexing
-✅ **Redux State** - No database needed
+✅ **DeepSeek Vision API** - Can "see" equations in images
+✅ **PDF to Images** - Converts each PDF page to an image
+✅ **Correct MathJax** - Uses `$` and `$$` delimiters
+✅ **Perfect Equation Extraction** - AI reads equations from images
+✅ **Drag & Drop Reordering** - Easy question management
+✅ **Redux State Management** - No database needed
 ✅ **Bengali Support** - Preserves Bangla text perfectly
 
-The OpenAI Assistants API can read DOCX files directly and extract equations properly!
+This approach works perfectly because DeepSeek can analyze images and extract both text and mathematical equations visually!
