@@ -35,14 +35,14 @@ project-root/
 ### 1. Install System Dependencies (Ubuntu/Debian)
 ```bash
 sudo apt-get update
-sudo apt-get install -y poppler-utils
+sudo apt-get install -y ghostscript graphicsmagick
 ```
 
 ### 2. Initialize Backend
 ```bash
 mkdir backend && cd backend
 npm init -y
-npm install express cors dotenv multer axios pdf-poppler sharp
+npm install express cors dotenv multer @google/generative-ai pdf2pic
 ```
 
 ### 3. backend/package.json
@@ -60,9 +60,8 @@ npm install express cors dotenv multer axios pdf-poppler sharp
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "multer": "^1.4.5-lts.1",
-    "axios": "^1.6.2",
-    "pdf-poppler": "^0.2.1",
-    "sharp": "^0.33.0"
+    "@google/generative-ai": "^0.19.0",
+    "pdf2pic": "^3.1.3"
   }
 }
 ```
@@ -70,7 +69,7 @@ npm install express cors dotenv multer axios pdf-poppler sharp
 ### 4. backend/.env
 ```
 PORT=5000
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
 ### 5. backend/server.js
@@ -129,8 +128,7 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { convert } from 'pdf-poppler';
-import sharp from 'sharp';
+import { fromPath } from 'pdf2pic';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -151,54 +149,56 @@ export const processPdf = async (req, res) => {
     }
 
     // Save PDF temporarily
-    tempPdfPath = path.join(tempDir, `${Date.now()}.pdf`);
+    const timestamp = Date.now();
+    tempPdfPath = path.join(tempDir, `${timestamp}.pdf`);
     fs.writeFileSync(tempPdfPath, req.file.buffer);
 
     // Create directory for images
-    tempImageDir = path.join(tempDir, `images-${Date.now()}`);
+    tempImageDir = path.join(tempDir, `images-${timestamp}`);
     if (!fs.existsSync(tempImageDir)) {
       fs.mkdirSync(tempImageDir, { recursive: true });
     }
 
     console.log('Converting PDF to images...');
 
-    // Convert PDF to images
+    // Configure pdf2pic
     const options = {
+      density: 200,           // DPI
+      saveFilename: 'page',
+      savePath: tempImageDir,
       format: 'png',
-      out_dir: tempImageDir,
-      out_prefix: 'page',
-      page: null // Convert all pages
+      width: 2000,
+      height: 3000
     };
 
-    await convert(tempPdfPath, options);
+    const converter = fromPath(tempPdfPath, options);
 
-    // Get all generated image files
-    const imageFiles = fs.readdirSync(tempImageDir)
-      .filter(file => file.endsWith('.png'))
-      .sort((a, b) => {
-        const numA = parseInt(a.match(/\d+/)[0]);
-        const numB = parseInt(b.match(/\d+/)[0]);
-        return numA - numB;
-      });
+    // Get PDF info to know how many pages
+    const pdfBuffer = fs.readFileSync(tempPdfPath);
+    const pdfText = pdfBuffer.toString('latin1');
+    const pageMatch = pdfText.match(/\/Count\s+(\d+)/);
+    const numPages = pageMatch ? parseInt(pageMatch[1]) : 10; // Default to 10 if can't detect
 
-    console.log(`Converted ${imageFiles.length} pages to images`);
+    console.log(`Converting ${numPages} pages...`);
 
-    // Convert images to base64
-    const imageBase64Array = [];
-    for (const imageFile of imageFiles) {
-      const imagePath = path.join(tempImageDir, imageFile);
-      const imageBuffer = fs.readFileSync(imagePath);
-      
-      // Optimize image with sharp (reduce size for API)
-      const optimizedBuffer = await sharp(imageBuffer)
-        .resize(2000, null, { withoutEnlargement: true })
-        .png({ quality: 90 })
-        .toBuffer();
-      
-      const base64Image = optimizedBuffer.toString('base64');
-      imageBase64Array.push(base64Image);
+    // Convert all pages
+    const imagePromises = [];
+    for (let i = 1; i <= numPages; i++) {
+      imagePromises.push(converter(i, { responseType: 'base64' }));
     }
 
+    const results = await Promise.all(imagePromises);
+    
+    // Extract base64 images
+    const imageBase64Array = results
+      .filter(result => result && result.base64)
+      .map(result => result.base64);
+
+    if (imageBase64Array.length === 0) {
+      throw new Error('Failed to convert PDF to images');
+    }
+
+    console.log(`Successfully converted ${imageBase64Array.length} pages to images`);
     console.log('Sending to DeepSeek API...');
 
     // Prepare messages with images
@@ -228,13 +228,13 @@ export const processPdf = async (req, res) => {
 
 Extract all math questions and convert them to JSON format. Each question should have:
 - index: sequential number starting from 1
-- question: the question text with math in MathJax format using $ for inline and $$ for display
+- question: the question text with math in MathJax format using $ for inline and $ for display
 - options: array of 4 options (a, b, c, d), with math in MathJax format
 - answer: the correct option letter (a, b, c, or d)
 
 CRITICAL RULES:
 - Use $ for inline math (e.g., $x^2-2x+4=0$)
-- Use $$ for display math (e.g., $$\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$$)
+- Use $ for display math (e.g., $\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$)
 - DO NOT use \\( \\) or \\[ \\]
 - Preserve all Bengali/Bangla text exactly
 - Extract equations exactly as they appear in the images
@@ -309,11 +309,15 @@ Example format:
       fs.unlinkSync(tempPdfPath);
     }
     if (tempImageDir && fs.existsSync(tempImageDir)) {
-      const files = fs.readdirSync(tempImageDir);
-      files.forEach(file => {
-        fs.unlinkSync(path.join(tempImageDir, file));
-      });
-      fs.rmdirSync(tempImageDir);
+      try {
+        const files = fs.readdirSync(tempImageDir);
+        files.forEach(file => {
+          fs.unlinkSync(path.join(tempImageDir, file));
+        });
+        fs.rmdirSync(tempImageDir);
+      } catch (cleanupError) {
+        console.error('Cleanup error:', cleanupError);
+      }
     }
   }
 };
