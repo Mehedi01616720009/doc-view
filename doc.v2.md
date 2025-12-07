@@ -1,4 +1,4 @@
-# Math Questions DOCX Converter
+# Math Questions DOCX Converter (OpenAI Version)
 
 ## Project Structure
 ```
@@ -37,7 +37,7 @@ project-root/
 ```bash
 mkdir backend && cd backend
 npm init -y
-npm install express cors dotenv multer axios form-data
+npm install express cors dotenv multer openai
 ```
 
 ### 2. backend/package.json
@@ -55,8 +55,7 @@ npm install express cors dotenv multer axios form-data
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "multer": "^1.4.5-lts.1",
-    "axios": "^1.6.2",
-    "form-data": "^4.0.0"
+    "openai": "^4.20.0"
   }
 }
 ```
@@ -64,7 +63,7 @@ npm install express cors dotenv multer axios form-data
 ### 3. backend/.env
 ```
 PORT=5000
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
 ```
 
 ### 4. backend/server.js
@@ -116,74 +115,131 @@ export default router;
 
 ### 6. backend/controllers/questionController.js
 ```javascript
-import axios from 'axios';
+import OpenAI from 'openai';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 export const processDocx = async (req, res) => {
+  let tempFilePath = null;
+
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const fileBuffer = req.file.buffer;
-    const base64File = fileBuffer.toString('base64');
+    // Save buffer to temporary file (OpenAI needs file path)
+    const tempDir = path.join(__dirname, '../temp');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
 
-    // Send to DeepSeek API
-    const response = await axios.post(
-      'https://api.deepseek.com/chat/completions',
-      {
-        model: 'deepseek-chat',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a helpful assistant that extracts math questions from documents and converts them to structured JSON format with MathJax notation.'
-          },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'file',
-                file_url: {
-                  url: `data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,${base64File}`
-                }
-              },
-              {
-                type: 'text',
-                text: `Extract all math questions from this document and convert them to JSON format. Each question should have:
+    tempFilePath = path.join(tempDir, `${Date.now()}-${req.file.originalname}`);
+    fs.writeFileSync(tempFilePath, req.file.buffer);
+
+    // Upload file to OpenAI
+    const file = await openai.files.create({
+      file: fs.createReadStream(tempFilePath),
+      purpose: 'assistants'
+    });
+
+    console.log('File uploaded to OpenAI:', file.id);
+
+    // Create assistant with file
+    const assistant = await openai.beta.assistants.create({
+      name: "Math Questions Extractor",
+      instructions: `You are a helpful assistant that extracts math questions from DOCX documents and converts them to structured JSON format with MathJax notation. 
+
+CRITICAL: Use proper MathJax delimiters:
+- For inline math: $x^2$ (single dollar signs)
+- For display math: $$\\frac{a}{b}$$ (double dollar signs)
+- DO NOT use \\( \\) or \\[ \\]
+
+Preserve Bengali/Bangla text exactly as written.`,
+      model: "gpt-4-turbo-preview",
+      tools: [{ type: "retrieval" }],
+      file_ids: [file.id]
+    });
+
+    // Create thread
+    const thread = await openai.beta.threads.create();
+
+    // Send message
+    await openai.beta.threads.messages.create(thread.id, {
+      role: "user",
+      content: `Extract all math questions from the uploaded DOCX file and convert them to JSON format.
+
+Each question should have:
 - index: sequential number starting from 1
-- question: the question text converted to MathJax format (use \\( \\) for inline math and \\[ \\] for display math)
-- options: array of 4 options, each converted to MathJax format
+- question: the question text with math in MathJax format using $ for inline and $$ for display
+- options: array of 4 options (a, b, c, d), with math in MathJax format
 - answer: the correct option letter (a, b, c, or d)
 
-Return ONLY a valid JSON array of questions, nothing else. Example format:
+IMPORTANT RULES:
+- Use $ for inline math (e.g., $x^2-2x+4=0$)
+- Use $$ for display math (e.g., $$\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$$)
+- Preserve all Bengali/Bangla text exactly
+- Extract equations exactly as they appear in the document
+- Identify the correct answer from the document
+
+Return ONLY a valid JSON array with no markdown code blocks or additional text.
+
+Example format:
 [
   {
     "index": 1,
-    "question": "\\(x^2-2x+4=0\\) এর মূলদ্বয় কত?",
+    "question": "$x^2-2x+4=0$ এর মূলদ্বয় কত?",
     "options": ["সমান", "জটিল ও অসমান", "বাস্তব ও অসমান", "জটিল ও সমান"],
     "answer": "d"
   }
 ]`
-              }
-            ]
-          }
-        ],
-        max_tokens: 4000,
-        temperature: 0.3
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    });
 
-    const aiResponse = response.data.choices[0].message.content;
+    // Run assistant
+    const run = await openai.beta.threads.runs.create(thread.id, {
+      assistant_id: assistant.id
+    });
+
+    // Poll for completion
+    let runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+    let attempts = 0;
+    const maxAttempts = 60; // 60 seconds timeout
+
+    while (runStatus.status !== 'completed' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+      attempts++;
+
+      if (runStatus.status === 'failed' || runStatus.status === 'cancelled') {
+        throw new Error(`Assistant run ${runStatus.status}`);
+      }
+    }
+
+    if (runStatus.status !== 'completed') {
+      throw new Error('Assistant run timed out');
+    }
+
+    // Get messages
+    const messages = await openai.beta.threads.messages.list(thread.id);
+    const assistantMessage = messages.data.find(m => m.role === 'assistant');
     
-    // Extract JSON from response
+    if (!assistantMessage || !assistantMessage.content[0]) {
+      throw new Error('No response from assistant');
+    }
+
+    const aiResponse = assistantMessage.content[0].text.value;
+    console.log('AI Response:', aiResponse.substring(0, 500));
+
+    // Parse JSON from response
     let questionsJson;
     try {
-      // Remove markdown code blocks if present
       let cleanedResponse = aiResponse.replace(/```json\n?|\n?```/g, '').trim();
       
       const jsonMatch = cleanedResponse.match(/\[[\s\S]*\]/);
@@ -192,23 +248,37 @@ Return ONLY a valid JSON array of questions, nothing else. Example format:
       } else {
         questionsJson = JSON.parse(cleanedResponse);
       }
+
+      if (!Array.isArray(questionsJson) || questionsJson.length === 0) {
+        throw new Error('Invalid questions array');
+      }
+
     } catch (parseError) {
       console.error('Parse error:', parseError);
-      console.error('AI Response:', aiResponse);
+      console.error('Full AI Response:', aiResponse);
       return res.status(500).json({ 
         error: 'Failed to parse AI response',
         aiResponse: aiResponse 
       });
     }
 
+    // Cleanup
+    await openai.beta.assistants.del(assistant.id);
+    await openai.files.del(file.id);
+
     res.json({ questions: questionsJson });
 
   } catch (error) {
-    console.error('Error processing DOCX:', error.response?.data || error.message);
+    console.error('Error processing DOCX:', error);
     res.status(500).json({ 
       error: 'Failed to process document',
-      details: error.response?.data || error.message 
+      details: error.message 
     });
+  } finally {
+    // Delete temporary file
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
   }
 };
 ```
@@ -296,8 +366,8 @@ export default function RootLayout({ children }) {
             __html: `
               window.MathJax = {
                 tex: {
-                  inlineMath: [['\\\\(', '\\\\)']],
-                  displayMath: [['\\\\[', '\\\\]']]
+                  inlineMath: [['$', '$']],
+                  displayMath: [['$$', '$$']]
                 }
               };
             `
@@ -316,7 +386,7 @@ export default function RootLayout({ children }) {
 ```javascript
 'use client';
 import { useState } from 'react';
-import { useDispatch } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
 import { useRouter } from 'next/navigation';
 import { setQuestions, setLoading, setError } from '../store/questionSlice';
 import axios from 'axios';
@@ -325,9 +395,11 @@ export default function Home() {
   const [file, setFile] = useState(null);
   const dispatch = useDispatch();
   const router = useRouter();
+  const { loading, error } = useSelector((state) => state.questions);
 
   const handleFileChange = (e) => {
     setFile(e.target.files[0]);
+    dispatch(setError(null));
   };
 
   const handleUpload = async (e) => {
@@ -383,13 +455,20 @@ export default function Home() {
                 hover:file:bg-blue-100"
             />
           </div>
+
+          {error && (
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
+              {error}
+            </div>
+          )}
           
           <button
             type="submit"
+            disabled={loading}
             className="w-full bg-blue-600 text-white py-2 px-4 rounded-md
-              hover:bg-blue-700 transition-colors font-medium"
+              hover:bg-blue-700 transition-colors font-medium disabled:bg-gray-400"
           >
-            Upload and Convert
+            {loading ? 'Processing...' : 'Upload and Convert'}
           </button>
         </form>
       </div>
@@ -403,10 +482,18 @@ export default function Home() {
 'use client';
 import { useEffect } from 'react';
 import { useSelector } from 'react-redux';
+import { useRouter } from 'next/navigation';
 import QuestionList from '../../components/QuestionList';
 
 export default function QuestionsPage() {
   const { items, loading, error } = useSelector((state) => state.questions);
+  const router = useRouter();
+
+  useEffect(() => {
+    if (items.length === 0 && !loading) {
+      router.push('/');
+    }
+  }, [items, loading, router]);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && window.MathJax) {
@@ -433,7 +520,15 @@ export default function QuestionsPage() {
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
       <div className="max-w-4xl mx-auto">
-        <h1 className="text-3xl font-bold mb-8">Questions Preview</h1>
+        <div className="flex justify-between items-center mb-8">
+          <h1 className="text-3xl font-bold">Questions Preview</h1>
+          <button
+            onClick={() => router.push('/')}
+            className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
+          >
+            Upload New File
+          </button>
+        </div>
         <QuestionList questions={items} />
       </div>
     </div>
@@ -525,14 +620,21 @@ export default function QuestionCard({ question }) {
     <div
       ref={setNodeRef}
       style={style}
-      className="bg-white p-6 rounded-lg shadow-md cursor-move hover:shadow-lg transition-shadow"
+      className="bg-white p-6 rounded-lg shadow-md hover:shadow-lg transition-shadow"
     >
-      <div {...attributes} {...listeners} className="mb-4">
-        <div className="flex items-start gap-2">
-          <span className="text-gray-500 font-mono text-sm">≡</span>
+      <div className="mb-4">
+        <div className="flex items-start gap-3">
+          <span 
+            {...attributes} 
+            {...listeners}
+            className="text-gray-400 cursor-move hover:text-gray-600 text-xl mt-1"
+          >
+            ⋮⋮
+          </span>
           <div className="flex-1">
             <div className="font-medium mb-3 text-lg">
-              {question.index}. <span dangerouslySetInnerHTML={{ __html: question.question }} />
+              <span className="text-gray-600">{question.index}.</span>{' '}
+              <span dangerouslySetInnerHTML={{ __html: question.question }} />
             </div>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -579,9 +681,14 @@ npm run dev
 
 Visit `http://localhost:3000` to upload your DOCX file!
 
-## Notes
-- DeepSeek API accepts DOCX files directly as base64
-- Questions are automatically converted to MathJax format
-- Drag and drop any question to reorder
-- Correct answers are highlighted in green
-- Questions are stored in Redux (no database needed)
+## Key Features
+
+✅ **OpenAI API** - Supports DOCX files with equations directly
+✅ **Correct MathJax** - Uses `$` for inline and `$$` for display math
+✅ **No Mammoth** - Direct DOCX processing by OpenAI
+✅ **Equation Extraction** - Preserves exact equations from Word documents
+✅ **Drag & Drop** - Reorder questions with automatic re-indexing
+✅ **Redux State** - No database needed
+✅ **Bengali Support** - Preserves Bangla text perfectly
+
+The OpenAI Assistants API can read DOCX files directly and extract equations properly!
