@@ -635,3 +635,37 @@ Visit `http://localhost:3000` to upload your DOCX file!
 -   Drag and drop any question to reorder
 -   Correct answers are highlighted in green
 -   Questions are stored in Redux (no database needed)
+
+```json
+[
+    {
+        "index": 1,
+        "question": "01. এককের একটি জটিল ঘনমূল $\\omega$ হলে $(1+\\omega^8-\\omega^{10})^3$ এর মান হবে-",
+        "options": ["0", "1", "4", "-4"],
+        "answer": "d"
+    },
+    {
+        "index": 2,
+        "question": "02. $x^2+y^2=100$ এর $(6, 8)$ বিন্দুতে অঙ্কিত স্পর্শক এর ঢাল কত?",
+        "options": ["-4", "$-\\frac{3}{4}$", "$\\frac{3}{4}$", "4"],
+        "answer": "b"
+    },
+    {
+        "index": 3,
+        "question": "03. $(6, 3)$, $(4, 7)$ ও $(11, 5)$ ত্রিভুজের তিনটি শীর্ষবিন্দু হলে এর ভরকেন্দ্র কত?",
+        "options": [
+            "$(7, 6)$",
+            "$(\\frac{21}{2}, \\frac{15}{2})$",
+            "$(7, 5)$",
+            "$(6, 5)$"
+        ],
+        "answer": "c"
+    },
+    {
+        "index": 4,
+        "question": "04. $x^2-2x+4=0$ এর মূলদ্বয় কত?",
+        "options": ["সমান", "জটিল ও অসমান", "বাস্তব ও অসমান", "জটিল ও সমান"],
+        "answer": "d"
+    }
+]
+```
